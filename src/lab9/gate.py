@@ -33,8 +33,79 @@ def integrity_check(pr: dict, base: dict, spec: dict, base_spec: dict | None = N
         including dropping no_significant_drop)
       - an item's slice tags in PR rows differ from the baseline's (relabelling an item out of a
         slice hides its regression from the slice gate)"""
-    # TODO M7
-    return []
+    import math
+
+    problems: list[str] = []
+    m = pr.get("manifest", {})
+    rows = pr.get("rows", [])
+    # Dropped or duplicated rows: every (item, seed) must appear exactly once.
+    want = m.get("items", 0) * len(m.get("seeds", []))
+    if len(rows) != want:
+        problems.append(f"{len(rows)} rows, expected {want} (items x seeds): rows were dropped or duplicated")
+    keys = [(r["item_id"], r["seed"]) for r in rows]
+    if len(set(keys)) != len(keys):
+        problems.append("duplicate (item, seed) rows")
+    base_keys = {(r["item_id"], r["seed"]) for r in base.get("rows", [])}
+    if set(keys) != base_keys:
+        problems.append("(item, seed) set differs from the baseline's: cherry-picked seeds or items")
+    # NaN / inf values, and evaluator crashes that silently drop out of the mean.
+    for k, v in pr.get("metrics", {}).items():
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            problems.append(f"metric {k} is {v}")
+    if pr.get("evaluator_failures"):
+        problems.append(f"{len(pr['evaluator_failures'])} evaluator failure(s): a crashed grader is not a pass")
+    graded = [x["id"] for x in spec.get("metrics", [])]
+    for r in rows:
+        for g in graded:
+            if g in r and r[g] is None:
+                problems.append(f"{r['item_id']}@{r['seed']}: {g} is None")
+                break
+    # Slice tags must match the baseline's, item by item.
+    base_tags = {r["item_id"]: sorted(r.get("slices") or []) for r in base.get("rows", [])}
+    for r in rows:
+        if r["item_id"] in base_tags and sorted(r.get("slices") or []) != base_tags[r["item_id"]]:
+            problems.append(f"{r['item_id']}: slice tags changed from the baseline's")
+            break
+    if base_spec is not None and spec.get("eval_set_version") == base_spec.get("eval_set_version"):
+        problems += ratchet_problems(spec, base_spec)
+    return problems
+
+
+def ratchet_problems(spec: dict, base_spec: dict) -> list[str]:
+    """Same eval-set version: thresholds may only get stricter. Report every loosening."""
+    out: list[str] = []
+    new = {m["id"]: m for m in spec.get("metrics", [])}
+    for old in base_spec.get("metrics", []):
+        mid = old["id"]
+        if mid not in new:
+            out.append(f"metric {mid} removed")
+            continue
+        n, o = new[mid], old
+        nt, ot = n.get("threshold", {}), o.get("threshold", {})
+        if "max" in ot and nt.get("max", float("inf")) > ot["max"]:
+            out.append(f"{mid}: max raised {ot['max']} -> {nt.get('max')}")
+        if "min" in ot and nt.get("min", float("-inf")) < ot["min"]:
+            out.append(f"{mid}: min lowered {ot['min']} -> {nt.get('min')}")
+        if "max_increase" in ot and nt.get("max_increase", float("inf")) > ot["max_increase"]:
+            out.append(f"{mid}: max_increase raised")
+        if ot.get("no_significant_drop") and not nt.get("no_significant_drop"):
+            out.append(f"{mid}: no_significant_drop removed")
+        if o.get("blocking") and not n.get("blocking"):
+            out.append(f"{mid}: blocking turned off")
+    new_slices = {s["name"]: s for s in spec.get("slices", [])}
+    for old in base_spec.get("slices", []):
+        name = old["name"]
+        if name not in new_slices:
+            out.append(f"slice {name} removed")
+            continue
+        n = new_slices[name]
+        if "min" in old and n.get("min", float("-inf")) < old["min"]:
+            out.append(f"slice {name}: min lowered {old['min']} -> {n.get('min')}")
+        if old.get("no_significant_drop") and not n.get("no_significant_drop"):
+            out.append(f"slice {name}: no_significant_drop removed")
+        if old.get("blocking") and not n.get("blocking"):
+            out.append(f"slice {name}: blocking turned off")
+    return out
 
 
 def slice_check(pr: dict, base: dict, spec: dict) -> tuple[list[str], list[str]]:
@@ -44,8 +115,32 @@ def slice_check(pr: dict, base: dict, spec: dict) -> tuple[list[str], list[str]]
       - fail if below "min", or if no_significant_drop and the paired CI over the slice's items
         lies entirely below 0
     Return (blocked ids like "slice:money_movement/pass_rate", report lines)."""
-    # TODO M5
-    return [], []
+    blocked: list[str] = []
+    lines: list[str] = []
+    bs = spec.get("bootstrap", {})
+    for s in spec.get("slices", []):
+        name, metric = s["name"], s["metric"]
+        pv, bv = per_item(pr, metric, slice_name=name), per_item(base, metric, slice_name=name)
+        keys = sorted(set(pv) & set(bv))
+        if not keys:
+            lines.append(f"  slice:{name}/{metric:<12} no items in both reports")
+            blocked.append(f"slice:{name}/{metric}")
+            continue
+        value = sum(pv[k] for k in keys) / len(keys)
+        fail, note = False, f"n={len(keys)}"
+        if "min" in s and value < s["min"]:
+            fail = True
+        if s.get("no_significant_drop") and len(keys) >= 2:
+            d, lo, hi = stats.paired_bootstrap([pv[k] for k in keys], [bv[k] for k in keys],
+                                               n_resamples=bs.get("n_resamples", 1000), rng=bs.get("rng", 2027))
+            note += f" Δ {d:+.3f} CI [{lo:+.3f}, {hi:+.3f}]"
+            if hi < 0:
+                fail = True
+        label = "BLOCK" if fail and s.get("blocking", True) else ("warn" if fail else "ok")
+        if fail and s.get("blocking", True):
+            blocked.append(f"slice:{name}/{metric}")
+        lines.append(f"  slice:{name}/{metric:<12} {value:<8.4f} min {s.get('min', '-')!s:<5} {note:<34} {label}")
+    return blocked, lines
 
 
 def check(pr: dict, base: dict, spec: dict, base_spec: dict | None = None) -> tuple[list[str], list[str]]:
